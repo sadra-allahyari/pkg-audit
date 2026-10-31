@@ -413,7 +413,12 @@ h1 span{color:var(--primary)}
 .verdict{display:flex;align-items:center;gap:14px;border-radius:16px;padding:14px 18px;margin-bottom:18px;font-weight:600}
 .verdict.good{background:var(--okbg);color:var(--ok)}.verdict.warn{background:var(--stalebg);color:var(--stale)}
 .verdict.alert{background:var(--badbg);color:var(--bad)}
-.verdict b{font-size:22px}.verdict small{display:block;font-weight:400;color:var(--muted);font-size:13px}
+.verdict b{font-size:22px}.vsub{font-weight:400;color:var(--muted);font-size:13.5px}
+.vsub p{margin:6px 0 0}.vsub ul{margin:8px 0 0;padding:0;list-style:none}
+.vsub li{margin:6px 0;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px}
+.vsub .eco{display:inline-flex;align-items:baseline;gap:8px;background:var(--card);border-radius:10px;padding:1px 10px}
+.vsub .eco a{font-weight:700;color:var(--fg);text-decoration:none}.vsub .eco bdi{font:12.5px ui-monospace,Menlo,Consolas,monospace}.vsub .more{color:var(--muted)}
+.vsub a{color:inherit;text-decoration:underline dotted}.vsub b{font-size:inherit;color:var(--fg)}.vsub em{color:var(--primary);font-style:normal}
 .nums{display:flex;flex-wrap:wrap;gap:8px 20px;margin-bottom:6px;color:var(--muted);font-size:13.5px}
 .nums b{color:var(--fg);font-weight:700}
 nav.tabs{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);
@@ -521,10 +526,37 @@ def page(report):
             ("stale", "◷", "قدیمی", "فقط Docker: تگ جابه‌جا شده و میرور نسخه‌ی قبلی را دارد؛ حمله نیست"),
             ("bad", "✕", "ناهمخوان", "مقداری که منبع رسمی ندارد؛ باید بررسی شود"),
             ("err", "!", "بدون پاسخ", "میرور جواب قابل استفاده نداد")])
+    def who(verdict, limit=6):
+        """`host (ecosystem): item, item` lines for every mirror with that verdict, worst first."""
+        found = {}
+        for g in groups:
+            for n, m in g["mirrors"].items():
+                items = [i for i, r in m["rows"].items() if r["verdict"] == verdict]
+                if items:
+                    found.setdefault(n, []).append((g, m, items))
+        lines = []
+        for n, entries in sorted(found.items(), key=lambda kv: -sum(len(e[2]) for e in kv[1])):
+            host = html.escape(entries[0][1]["url"].split("://", 1)[-1].split("/")[0])
+            ours = bool(BRAND["ours"]) and n == BRAND["ours"]
+            tag = f' <em>{html.escape(BRAND["ours_label"])}</em>' if ours else ""
+            parts = []
+            for g, m, items in entries:
+                shown = "  ·  ".join(html.escape(i) for i in items[:3])
+                more = f' <span class="more">+{fa(len(items) - 3)}</span>' if len(items) > 3 else ""
+                parts.append(f'<span class="eco"><a href="#{g["id"]}">{html.escape(g["title"])}</a>'
+                             f'<bdi dir="ltr">{shown}</bdi>{more}</span>')
+            lines.append(f'<li><b><bdi dir="ltr">{host}</bdi>{tag}</b>{"".join(parts)}</li>')
+        extra = f"<li>و {fa(len(lines) - limit)} میرور دیگر</li>" if len(lines) > limit else ""
+        return "<ul>" + "".join(lines[:limit]) + extra + "</ul>" if lines else ""
+
     if counts["mismatch"]:
-        vclass, vtext, vsub = "alert", f"{fa(counts['mismatch'])} مورد ناهمخوان", "با منبع رسمی نمی‌خواند؛ جزئیات را ببینید"
+        vclass, vtext = "alert", f"{fa(counts['mismatch'])} مورد ناهمخوان با منبع رسمی"
+        vsub = who("mismatch")
     elif counts["stale"] or counts["error"]:
-        vclass, vtext, vsub = "warn", "ناهمخوانی دیده نشد", "فقط بعضی میرورها نسخه‌ی قدیمی دارند یا جواب نداده‌اند"
+        vclass, vtext = "warn", "ناهمخوانی دیده نشد"
+        stale, err = who("stale", 4), who("error", 4)
+        vsub = ((f"<p>نسخه‌ی قدیمی (تگ جابه‌جا شده):</p>{stale}") if stale else "") + \
+               ((f"<p>بدون پاسخ:</p>{err}") if err else "")
     else:
         vclass, vtext, vsub = "good", "همه‌چیز با منبع رسمی می‌خواند", "هیچ ناهمخوانی دیده نشد"
     nav = "".join(f'<a href="#{g["id"]}">{html.escape(g["title"])}</a>' for g in groups)
@@ -559,7 +591,7 @@ def page(report):
 <h1>پایش <span>میرورها</span></h1>
 <p class="lead">بسته‌ها و ایمیج‌های پرکاربرد را از هر میرور می‌پرسیم و با پاسخ منبع رسمی مقایسه می‌کنیم،
 از سروری مستقل از میرورها. آخرین بررسی: {when}. هر ساعت تکرار می‌شود.</p>
-<div class="verdict {vclass}"><div><b>{vtext}</b><small>{vsub}</small></div></div>
+<div class="verdict {vclass}"><div><b>{vtext}</b><div class="vsub">{vsub}</div></div></div>
 <div class="nums"><span><b>{fa(len(seen))}</b> میزبان</span><span><b>{fa(len(groups))}</b> اکوسیستم</span>
 <span><b>{fa(counts["ok"])}</b> از <b>{fa(total)}</b> پاسخ سالم</span><span><b>{fa(counts["stale"])}</b> قدیمی</span>
 <span><b>{fa(counts["error"])}</b> بدون پاسخ</span></div>

@@ -137,6 +137,12 @@ class Page(unittest.TestCase):
         self.assertNotIn("<script>", out)
         self.assertIn("&lt;b&gt;us&lt;/b&gt;", out)
         self.assertIn("ناهمخوان", out)
+        # the headline names the mirror, the ecosystem and the item
+        head = out[out.index('class="verdict'):out.index('class="nums"')]
+        self.assertIn("m.example", head)
+        self.assertIn('href="#npm"', head)
+        self.assertIn("x@1", head)
+        self.assertIn("&lt;b&gt;us&lt;/b&gt;", head)  # marked as ours
         self.assertNotIn("og:image", out)  # no site_url, no preview tags
         pa.BRAND["site_url"] = "https://audit.example.com/"
         out = pa.page({"generated": "2026-01-01T00:00:00Z", "groups": [group]})
