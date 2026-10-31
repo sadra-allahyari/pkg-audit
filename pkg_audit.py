@@ -40,6 +40,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -205,13 +206,22 @@ TITLES = {
 }
 
 
-def get(url, accept="*/*"):
+def get(url, accept="*/*", tries=3):
+    """GET with a few retries: a mirror or the official source resetting one connection is not a verdict."""
     req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "pkg-audit/1"})
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            return resp.headers.get("Content-Type", ""), resp.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code}")
+    last = None
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return resp.headers.get("Content-Type", ""), resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500 and exc.code != 429:
+                raise RuntimeError(f"HTTP {exc.code}")
+            last = f"HTTP {exc.code}"
+        except (urllib.error.URLError, OSError) as exc:
+            last = str(getattr(exc, "reason", exc))[:60]
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(last or "no answer")
 
 
 def pypi_files(base, name, version):
@@ -278,6 +288,8 @@ def audit_packages(kind, items, targets):
         except Exception as exc:
             print(f"{kind} {item}: official source did not answer ({exc}); skipped", file=sys.stderr)
     items = [i for i in items if i in official]
+    if not items:
+        return None
     title, note = TITLES[kind]
     group = {"id": kind, "title": title, "items": items, "mirrors": {}, "note": note}
     for name, base in targets:
@@ -317,120 +329,108 @@ BRAND = dict(DEFAULT_BRAND)
 
 CSS = """
 @font-face{font-family:Vazirmatn;src:url(/vazirmatn.woff2) format('woff2');font-weight:100 900;font-display:swap}
-:root{--bg:#f3efe6;--card:#faf7f0;--fg:#0e2218;--muted:#5a6a60;--line:#dcd6c8;--primary:#157a4a;
---ok:#157a4a;--okbg:#157a4a1f;--stale:#9a6700;--stalebg:#bf870026;--bad:#c4263c;--badbg:#c4263c24;
---err:#5a6a60;--errbg:#5a6a6020;--font:Vazirmatn,Tahoma,'Segoe UI',system-ui,sans-serif}
-@media(prefers-color-scheme:dark){:root{--bg:#0e1714;--card:#131f1b;--fg:#e2ebe5;--muted:#93a69b;--line:#1f302a;
---primary:#6fd69a;--ok:#6fd69a;--okbg:#6fd69a22;--stale:#e3b341;--stalebg:#e3b34124;--bad:#ff7a8a;--badbg:#ff7a8a24;
---err:#93a69b;--errbg:#93a69b1c}}
-*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+:root{--bg:#f4f1ea;--card:#fff;--fg:#0e2218;--muted:#5d6d63;--line:#e2ddd0;--primary:#157a4a;
+--ok:#1f9d5c;--stale:#d19a1a;--bad:#d6334a;--err:#98a39c;
+--okbg:#1f9d5c1c;--stalebg:#d19a1a24;--badbg:#d6334a1f;--errbg:#98a39c26;
+--font:Vazirmatn,Tahoma,'Segoe UI',system-ui,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0b1411;--card:#111c18;--fg:#e4ede7;--muted:#8ea196;--line:#1d2d26;
+--primary:#6fd69a;--ok:#4ccf86;--stale:#e6b640;--bad:#ff6f83;--err:#6f8178;
+--okbg:#4ccf8622;--stalebg:#e6b64024;--badbg:#ff6f8326;--errbg:#6f817826}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.8 var(--font)}
 a{color:var(--primary);text-decoration:none}a:hover{text-decoration:underline}
-.wrap{max-width:1120px;margin:0 auto;padding:0 16px}
-header{padding:28px 0 8px;display:flex;align-items:center;gap:14px}
-header img{width:44px;height:44px;border-radius:12px;flex:none}
-header .brand{font-weight:700;font-size:15px}header .brand small{display:block;color:var(--muted);font-weight:400;font-size:12.5px}
-h2.gt{font-size:20px;margin:26px 0 10px;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px}
-h2.gt small{color:var(--muted);font-size:13px;font-weight:400}
-.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 6px}
-.tabs a{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:3px 14px;font-size:13.5px;color:var(--fg)}
-.tabs a:hover{border-color:var(--primary);text-decoration:none}
-h1{font-size:clamp(24px,4vw,34px);line-height:1.4;margin:18px 0 6px;font-weight:800}
+.wrap{max-width:980px;margin:0 auto;padding:0 18px}
+header{padding:26px 0 0;display:flex;align-items:center;gap:12px}
+header img{width:40px;height:40px;border-radius:11px;flex:none}
+header .brand{font-weight:700;line-height:1.4}header .brand small{display:block;color:var(--muted);font-weight:400;font-size:12.5px}
+h1{font-size:clamp(26px,5vw,40px);line-height:1.35;margin:22px 0 8px;font-weight:800;letter-spacing:-.01em}
 h1 span{color:var(--primary)}
-.lead{color:var(--muted);margin:0 0 22px;max-width:72ch}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 16px}
-.stat b{display:block;font-size:26px;line-height:1.3}.stat span{color:var(--muted);font-size:13px}
-.stat.good b{color:var(--ok)}.stat.warn b{color:var(--stale)}.stat.alert b{color:var(--bad)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:18px;overflow:hidden;margin-bottom:22px}
-.scroll{overflow-x:auto}
-table{border-collapse:separate;border-spacing:0;width:100%;min-width:880px}
-th,td{padding:9px 6px;text-align:center;border-bottom:1px solid var(--line);white-space:nowrap}
-thead th{white-space:normal;overflow-wrap:anywhere;min-width:96px;font-size:12.5px;font-weight:600;color:var(--muted);vertical-align:bottom;background:var(--card)}
-thead th.ours{color:var(--primary)}
-tbody th{padding-inline:12px;text-align:left;direction:ltr;position:sticky;right:0;background:var(--card);font-weight:500;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
-tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
-.host{direction:ltr;display:block;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;font-weight:500;line-height:1.5}
-.name{display:block;font-size:13px;color:var(--fg)}
-.meter{height:5px;border-radius:3px;background:var(--errbg);margin:7px auto 0;width:84px;overflow:hidden}
-.meter i{display:block;height:100%;background:var(--ok)}
-.pct{font-size:12px;color:var(--muted)}
-.b{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:600}
+.lead{color:var(--muted);margin:0 0 20px;max-width:64ch}
+.verdict{display:flex;align-items:center;gap:14px;border-radius:16px;padding:14px 18px;margin-bottom:18px;font-weight:600}
+.verdict.good{background:var(--okbg);color:var(--ok)}.verdict.warn{background:var(--stalebg);color:var(--stale)}
+.verdict.alert{background:var(--badbg);color:var(--bad)}
+.verdict b{font-size:22px}.verdict small{display:block;font-weight:400;color:var(--muted);font-size:13px}
+.nums{display:flex;flex-wrap:wrap;gap:8px 20px;margin-bottom:6px;color:var(--muted);font-size:13.5px}
+.nums b{color:var(--fg);font-weight:700}
+nav.tabs{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);
+display:flex;gap:6px;overflow-x:auto;padding:10px 0;margin:6px 0 4px;scrollbar-width:none}
+nav.tabs::-webkit-scrollbar{display:none}
+nav.tabs a{flex:none;border-radius:999px;padding:3px 14px;font-size:13.5px;color:var(--muted);border:1px solid var(--line);background:var(--card)}
+nav.tabs a:hover{color:var(--fg);border-color:var(--primary);text-decoration:none}
+h2.gt{font-size:21px;margin:30px 0 2px;scroll-margin-top:56px}
+p.gn{color:var(--muted);font-size:13.5px;margin:0 0 12px}
+.list{background:var(--card);border:1px solid var(--line);border-radius:18px;overflow:hidden}
+details.m{border-bottom:1px solid var(--line)}details.m:last-child{border-bottom:0}
+details.m summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:minmax(0,1.25fr) auto minmax(0,1.6fr) 18px;
+align-items:center;gap:6px 18px;padding:13px 18px}
+details.m summary::-webkit-details-marker{display:none}
+details.m summary:hover{background:var(--errbg)}
+details.m summary:after{content:"‹";color:var(--muted);font-size:20px;line-height:1;transition:transform .15s}
+details.m[open] summary:after{transform:rotate(-90deg)}
+.who{min-width:0}.who .host{direction:ltr;text-align:right;display:block;font:13px ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.tag{display:inline-block;font-size:11.5px;font-weight:700;color:var(--primary);border:1px solid var(--primary);border-radius:999px;padding:0 8px;margin-inline-start:8px;vertical-align:1px}
+.score{font-weight:800;font-size:17px;min-width:3.2em;text-align:center}.score small{font-weight:400;color:var(--muted);font-size:11.5px;display:block;line-height:1.2}
+.score.good{color:var(--ok)}.score.warn{color:var(--stale)}.score.alert{color:var(--bad)}.score.none{color:var(--err)}
+.strip{display:flex;flex-wrap:wrap;gap:3px}
+.sq{width:14px;height:14px;border-radius:4px;background:var(--ok);display:block}
+.sq.stale{background:var(--stale)}.sq.bad{background:var(--bad)}.sq.err{background:var(--err)}
+.items{margin:0;padding:2px 18px 12px;list-style:none;border-top:1px dashed var(--line)}
+.items li{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
+.items li:last-child{border-bottom:0}
+.items code{direction:ltr;font:13px ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.b{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:1px 10px;font-size:12px;font-weight:600;flex:none}
 .b.ok{color:var(--ok);background:var(--okbg)}.b.stale{color:var(--stale);background:var(--stalebg)}
 .b.bad{color:var(--bad);background:var(--badbg)}.b.err{color:var(--err);background:var(--errbg)}
-.legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px 18px;padding:14px 16px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+.legend{display:flex;flex-wrap:wrap;gap:8px 22px;margin:22px 0 6px;color:var(--muted);font-size:13px}
 .legend div{display:flex;align-items:center;gap:8px}
-section.note{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:6px 20px 14px;margin-bottom:22px}
-section.note h2{font-size:17px;margin:14px 0 4px}section.note p,section.note li{color:var(--muted);margin:4px 0}
+section.note{margin:26px 0;padding:6px 0}
+section.note h2{font-size:17px;margin:18px 0 4px}section.note p,section.note li{color:var(--muted);margin:4px 0}
 section.note ul{padding-inline-start:20px;margin:6px 0}
-.cards{display:none}
-.mc{background:var(--card);border:1px solid var(--line);border-radius:16px;margin-bottom:10px;overflow:hidden}
-.mc.ours{border-color:var(--primary)}
-.mc summary{list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:12px}
-.mc summary::-webkit-details-marker{display:none}
-.mc .who{flex:1;min-width:0}.mc .who .host{font-size:12.5px;overflow-wrap:anywhere}
-.mc .who .name{font-weight:700;color:var(--primary)}
-.mc .sum{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex:none}
-.mc .sum .meter{width:72px;margin:0}
-.mc summary:after{content:"‹";color:var(--muted);font-size:20px;transition:transform .2s;flex:none}
-.mc[open] summary:after{transform:rotate(-90deg)}
-.mc ul{list-style:none;margin:0;padding:0 16px 10px;border-top:1px solid var(--line)}
-.mc li{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
-.mc li:last-child{border-bottom:0}
-.mc li code{direction:ltr;font:13px ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
-@media(max-width:720px){
-.card{display:none}.cards{display:block;margin-bottom:22px}
-.stats{grid-template-columns:repeat(2,1fr);gap:10px}.stats .stat:last-child{grid-column:1/-1}
-.stat{padding:12px 14px}.stat b{font-size:22px}
-header{padding-top:20px}.lead{font-size:14px}
-section.note{padding:2px 16px 12px}
-}
-footer{border-top:1px solid var(--line);padding:22px 0 40px;color:var(--muted);font-size:13.5px}
+footer{border-top:1px solid var(--line);padding:22px 0 44px;color:var(--muted);font-size:13.5px}
 footer .row{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px}
+@media(max-width:680px){
+details.m summary{grid-template-columns:minmax(0,1fr) auto 18px;padding:12px 14px}
+.strip{grid-column:1/-1;order:5}
+.items{padding:2px 14px 10px}
+}
 """
 
 
 def render_group(g, fa):
-    names, refs, rows = list(g["mirrors"]), g["items"], g["mirrors"]
-    head = body = ""
-    for n in names:
-        done = sum(r["verdict"] == "ok" for r in rows[n]["rows"].values())
-        pct = round(100 * done / len(refs)) if refs else 0
+    refs, mirrors = g["items"], g["mirrors"]
+    summary = []
+    for n, m in mirrors.items():
+        rows = m["rows"]
+        done = sum(r["verdict"] == "ok" for r in rows.values())
+        bad = sum(r["verdict"] == "mismatch" for r in rows.values())
+        answered = sum(r["verdict"] != "error" for r in rows.values())
         ours = bool(BRAND["ours"]) and n == BRAND["ours"]
-        label = f'<span class="name">{html.escape(BRAND["ours_label"])}</span>' if ours else ""
-        host = html.escape(rows[n]["url"].split("://", 1)[-1])
-        head += (f'<th class="{"ours" if ours else ""}">{label}<span class="host">{host}</span>'
-                 f'<div class="meter" title="{fa(done)} از {fa(len(refs))} سالم"><i style="width:{pct}%"></i></div>'
-                 f'<span class="pct">{fa(pct)}٪ سالم</span></th>')
-    for ref in refs:
-        cells = ""
-        for n in names:
-            row = rows[n]["rows"][ref]
-            cls, icon, label = BADGE[row["verdict"]]
-            tip = html.escape(((row["value"] or "") + " " + row["detail"]).strip())
-            cells += f'<td><span class="b {cls}" title="{tip}"><span aria-hidden="true">{icon}</span>{label}</span></td>'
-        body += f"<tr><th scope=\"row\">{html.escape(ref)}</th>{cells}</tr>"
-    mobile = '<div class="cards">'
-    for n in names:
-        mi = rows[n]["rows"]
-        done = sum(r["verdict"] == "ok" for r in mi.values())
+        summary.append((not ours, -bad, -done, n, m, done, bad, answered, ours))
+    summary.sort(key=lambda t: t[:4])  # ours first, then problems, then best score
+    out = ""
+    for _, _, _, n, m, done, bad, answered, ours in summary:
+        rows = m["rows"]
         pct = round(100 * done / len(refs)) if refs else 0
-        ours = bool(BRAND["ours"]) and n == BRAND["ours"]
-        host = html.escape(rows[n]["url"].split("://", 1)[-1])
+        tone = "none" if not answered else "alert" if bad else "good" if done == len(refs) else "warn"
+        host = html.escape(m["url"].split("://", 1)[-1])
+        tag = f'<span class="tag">{html.escape(BRAND["ours_label"])}</span>' if ours else ""
+        strip = ""
+        for ref in refs:
+            cls = BADGE[rows[ref]["verdict"]][0]
+            tip = html.escape(f'{ref}: {BADGE[rows[ref]["verdict"]][2]} {rows[ref]["detail"]}'.strip())
+            strip += f'<i class="sq {"" if cls == "ok" else cls}" title="{tip}"></i>'
         items = ""
-        for ref in sorted(refs, key=lambda r: mi[r]["verdict"] == "ok"):  # problems first
-            cls, icon, label = BADGE[mi[ref]["verdict"]]
-            items += (f'<li><code>{html.escape(ref)}</code><span class="b {cls}">'
+        for ref in sorted(refs, key=lambda r: rows[r]["verdict"] == "ok"):  # problems first
+            cls, icon, label = BADGE[rows[ref]["verdict"]]
+            tip = html.escape(((rows[ref]["value"] or "") + " " + rows[ref]["detail"]).strip())
+            items += (f'<li><code>{html.escape(ref)}</code><span class="b {cls}" title="{tip}">'
                       f'<span aria-hidden="true">{icon}</span>{label}</span></li>')
-        opened = " open" if done != len(refs) else ""
-        name = f'<span class="name">{html.escape(BRAND["ours_label"])}</span>' if ours else ""
-        mobile += (f'<details class="mc{" ours" if ours else ""}"{opened}><summary><div class="who">{name}'
-                   f'<span class="host">{host}</span></div><div class="sum"><span class="pct">{fa(done)} از {fa(len(refs))} سالم</span>'
-                   f'<div class="meter"><i style="width:{pct}%"></i></div></div></summary><ul>{items}</ul></details>')
-    mobile += "</div>"
-    return (f'<h2 class="gt" id="{g["id"]}">{html.escape(g["title"])}<small>{html.escape(g["note"])}</small></h2>'
-            f'<div class="card"><div class="scroll"><table><thead><tr><th></th>{head}</tr></thead>'
-            f'<tbody>{body}</tbody></table></div></div>{mobile}')
+        opened = " open" if bad else ""
+        out += (f'<details class="m"{opened}><summary><div class="who"><span class="host">{host}</span>{tag}</div>'
+                f'<div class="score {tone}">{fa(pct)}٪<small>{fa(done)} از {fa(len(refs))}</small></div>'
+                f'<div class="strip">{strip}</div></summary><ul class="items">{items}</ul></details>')
+    return (f'<h2 class="gt" id="{g["id"]}">{html.escape(g["title"])}</h2>'
+            f'<p class="gn">{html.escape(g["note"])}</p><div class="list">{out}</div>')
 
 
 def page(report):
@@ -457,6 +457,12 @@ def page(report):
             ("stale", "◷", "قدیمی", "فقط Docker: تگ جابه‌جا شده و میرور نسخه‌ی قبلی را دارد؛ حمله نیست"),
             ("bad", "✕", "ناهمخوان", "مقداری که منبع رسمی ندارد؛ باید بررسی شود"),
             ("err", "!", "بدون پاسخ", "میرور جواب قابل استفاده نداد")])
+    if counts["mismatch"]:
+        vclass, vtext, vsub = "alert", f"{fa(counts['mismatch'])} مورد ناهمخوان", "با منبع رسمی نمی‌خواند؛ جزئیات را ببینید"
+    elif counts["stale"] or counts["error"]:
+        vclass, vtext, vsub = "warn", "ناهمخوانی دیده نشد", "فقط بعضی میرورها نسخه‌ی قدیمی دارند یا جواب نداده‌اند"
+    else:
+        vclass, vtext, vsub = "good", "همه‌چیز با منبع رسمی می‌خواند", "هیچ ناهمخوانی دیده نشد"
     nav = "".join(f'<a href="#{g["id"]}">{html.escape(g["title"])}</a>' for g in groups)
     sections = "".join(render_group(g, fa) for g in groups)
 
@@ -472,16 +478,13 @@ def page(report):
 <h1>پایش <span>میرورها</span></h1>
 <p class="lead">بسته‌ها و ایمیج‌های پرکاربرد را از هر میرور می‌پرسیم و با پاسخ منبع رسمی مقایسه می‌کنیم،
 از سروری مستقل از میرورها. آخرین بررسی: {when}. هر ساعت تکرار می‌شود.</p>
-<div class="stats">
-<div class="stat"><b>{fa(len(seen))}</b><span>میزبان بررسی‌شده</span></div>
-<div class="stat"><b>{fa(len(groups))}</b><span>اکوسیستم</span></div>
-<div class="stat good"><b>{fa(counts["ok"])}<small style="font-size:14px;font-weight:400"> از {fa(total)}</small></b><span>پاسخ سالم</span></div>
-<div class="stat warn"><b>{fa(counts["stale"])}</b><span>نسخه‌ی قدیمی</span></div>
-<div class="stat alert"><b>{fa(counts["mismatch"])}</b><span>ناهمخوان</span></div>
-</div>
+<div class="verdict {vclass}"><div><b>{vtext}</b><small>{vsub}</small></div></div>
+<div class="nums"><span><b>{fa(len(seen))}</b> میزبان</span><span><b>{fa(len(groups))}</b> اکوسیستم</span>
+<span><b>{fa(counts["ok"])}</b> از <b>{fa(total)}</b> پاسخ سالم</span><span><b>{fa(counts["stale"])}</b> قدیمی</span>
+<span><b>{fa(counts["error"])}</b> بدون پاسخ</span></div>
 <nav class="tabs">{nav}</nav>
 {sections}
-<div class="card"><div class="legend">{legend}</div></div>
+<div class="legend">{legend}</div>
 <section class="note"><h2>این صفحه چه چیزی را نشان می‌دهد؟</h2>
 <p>برای هر اکوسیستم، همان داده‌ای را از میرور و از منبع رسمی می‌گیریم که ابزار نصب به آن اعتماد می‌کند
 (digest در Docker، هش در npm و PyPI، cksum در Cargo، sha1 در Maven، فایل checksum نصب‌کننده‌ها) و مقایسه می‌کنیم.
@@ -530,7 +533,9 @@ def main():
             targets.setdefault(kind, []).append((name, base))
         for kind in OFFICIAL:
             if items.get(kind) and targets.get(kind):
-                report["groups"].append(audit_packages(kind, items[kind], targets[kind]))
+                group = audit_packages(kind, items[kind], targets[kind])
+                if group:
+                    report["groups"].append(group)
     if args.json:
         write_atomic(args.json, json.dumps(report, indent=2) + "\n")
     if args.html:
