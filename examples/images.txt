@@ -1,0 +1,14 @@
+# Images whose official digests are published signed (scripts/image-digests.py fetch).
+# One name:tag per line; official images without library/.
+alpine:3.20
+alpine:3.22
+debian:12
+debian:bookworm-slim
+ubuntu:24.04
+python:3.12-slim
+node:22-slim
+golang:1.23
+nginx:stable
+postgres:16
+redis:7
+curlimages/curl:8.10.1

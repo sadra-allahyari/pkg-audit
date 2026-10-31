@@ -1,0 +1,13 @@
+# Hourly audit on a runner outside the network of the mirrors (pipeline schedule). Pin the
+# commit of pkg-audit you reviewed instead of a branch.
+audit:
+  image: python:3.12-slim
+  variables:
+    PKG_AUDIT_COMMIT: "<commit sha>"
+  script:
+    - python3 -c "import urllib.request as u; u.urlretrieve('https://raw.githubusercontent.com/shecanir/pkg-audit/$PKG_AUDIT_COMMIT/pkg_audit.py', 'pkg_audit.py')"
+    - mkdir -p site
+    - python3 pkg_audit.py images.txt docker-mirrors.txt --packages packages.txt --targets targets.txt --brand brand.json --json site/report.json --html site/index.html
+  artifacts:
+    when: always
+    paths: [site]

@@ -1,0 +1,13 @@
+# Mirrors checked for each package kind: kind name base-url
+# Kinds: npm pypi cargo maven rubygems nodejs golang gradle helm k8s hashicorp
+npm       mymirror  https://mirror-npm.example.com
+pypi      mymirror  https://mirror-pypi.example.com
+cargo     mymirror  https://mirror-cargo.example.com/index
+maven     mymirror  https://mirror-maven.example.com/central
+rubygems  mymirror  https://mirror-rubygems.example.com
+nodejs    mymirror  https://mirror-nodejs.example.com/dist
+golang    mymirror  https://mirror-golang.example.com/go
+gradle    mymirror  https://mirror-gradle.example.com/distributions
+helm      mymirror  https://mirror-kubernetes.example.com/helm
+k8s       mymirror  https://mirror-kubernetes.example.com/release
+hashicorp mymirror  https://mirror-hashicorp.example.com

@@ -1,0 +1,10 @@
+# Docker registry mirrors: name URL [pinned-ip]
+# A pinned ip sends the TLS connection to that address (host name still used for SNI and the
+# certificate), to probe one PoP or proxy of a mirror instead of what DNS answers.
+mymirror   https://mirror-docker.example.com
+docker.arvancloud.ir  https://docker.arvancloud.ir
+hub.hamdocker.ir      https://hub.hamdocker.ir
+docker.iranserver.com https://docker.iranserver.com
+registry.docker.ir    https://registry.docker.ir
+docker.abrha.net      https://docker.abrha.net
+focker.ir             https://focker.ir
