@@ -384,6 +384,7 @@ DEFAULT_BRAND = {
     "description": "مقایسه‌ی مستقل بسته‌ها و ایمیج‌های میرورها با منبع رسمی",
     "footer_html": "",               # trusted HTML for the page footer
     "site_url": "",                  # public URL of the page, e.g. https://audit.example.com; enables link previews
+    "source_url": "",                # public repository of this tool; shown in the header and the notes
     "og_image": "/og.jpg",           # 1200x630 JPEG, path under site_url, for link previews (Telegram, Bale, ...)
 }
 BRAND = dict(DEFAULT_BRAND)
@@ -404,6 +405,8 @@ a{color:var(--primary);text-decoration:none}a:hover{text-decoration:underline}
 header{padding:26px 0 0;display:flex;align-items:center;gap:12px}
 header img{width:40px;height:40px;border-radius:11px;flex:none}
 header .brand{font-weight:700;line-height:1.4}header .brand small{display:block;color:var(--muted);font-weight:400;font-size:12.5px}
+header .src{margin-inline-start:auto;direction:ltr;font:600 12.5px ui-monospace,Menlo,Consolas,monospace;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:999px;padding:4px 12px;white-space:nowrap}
+header .src:hover{border-color:var(--primary);color:var(--primary);text-decoration:none}
 h1{font-size:clamp(26px,5vw,40px);line-height:1.35;margin:22px 0 8px;font-weight:800;letter-spacing:-.01em}
 h1 span{color:var(--primary)}
 .lead{color:var(--muted);margin:0 0 20px;max-width:64ch}
@@ -527,6 +530,11 @@ def page(report):
     nav = "".join(f'<a href="#{g["id"]}">{html.escape(g["title"])}</a>' for g in groups)
     sections = "".join(render_group(g, fa) for g in groups)
 
+    src = BRAND["source_url"]
+    src_label = html.escape(src.split("://", 1)[-1].rstrip("/"))
+    src_link = f'<a class="src" href="{html.escape(src)}" rel="noopener">{src_label} ↗</a>' if src else ""
+    src_note = (f'<p>کد این بازرس متن‌باز است و هر کسی می‌تواند بخواند، اجرا کند و میرور خودش را اضافه کند: '
+                f'<a href="{html.escape(src)}" dir="ltr">{src_label}</a>.</p>') if src else ""
     social = ""
     if BRAND["site_url"]:
         base = BRAND["site_url"].rstrip("/")
@@ -547,7 +555,7 @@ def page(report):
 {social}<link rel="icon" href="/favicon.svg" type="image/svg+xml"><style>{CSS}</style></head>
 <body><div class="wrap">
 <header><img src="/favicon.svg" alt="" width="44" height="44">
-<div class="brand">{html.escape(BRAND["name"])}<small>{html.escape(BRAND["tagline"])}</small></div></header>
+<div class="brand">{html.escape(BRAND["name"])}<small>{html.escape(BRAND["tagline"])}</small></div>{src_link}</header>
 <h1>پایش <span>میرورها</span></h1>
 <p class="lead">بسته‌ها و ایمیج‌های پرکاربرد را از هر میرور می‌پرسیم و با پاسخ منبع رسمی مقایسه می‌کنیم،
 از سروری مستقل از میرورها. آخرین بررسی: {when}. هر ساعت تکرار می‌شود.</p>
@@ -568,6 +576,8 @@ def page(report):
 <li>فایل بسته دانلود نمی‌شود؛ مقدار هش و checksumی سنجیده می‌شود که ابزار نصب از میرور می‌گیرد.</li>
 <li>نام ستون‌ها فقط نشانی میزبان است؛ اینکه کدام شرکت اداره‌اش می‌کند را خودش باید تأیید کند.
 میرورهایی که بدون ثبت‌نام یا اعتبار پاسخ نمی‌دهند بررسی نشده‌اند.</li></ul>
+<h2>کد منبع</h2>
+{src_note}
 <h2>برای پروژه‌های حساس</h2>
 <p>هش را از منبع رسمی ثابت کنید: lockfile با هش (<bdi dir="ltr">package-lock.json</bdi>، <bdi dir="ltr">uv.lock</bdi>،
 <bdi dir="ltr">pip --require-hashes</bdi>)، <bdi dir="ltr">distributionSha256Sum</bdi> در Gradle Wrapper، و در Docker

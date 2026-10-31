@@ -143,6 +143,12 @@ class Page(unittest.TestCase):
         self.assertIn('property="og:image" content="https://audit.example.com/og.jpg"', out)
         self.assertIn('name="twitter:card" content="summary_large_image"', out)
         pa.BRAND["site_url"] = ""
+        self.assertNotIn('class="src"', out)
+        pa.BRAND["source_url"] = "https://github.com/example/pkg-audit"
+        out = pa.page({"generated": "2026-01-01T00:00:00Z", "groups": [group]})
+        self.assertIn('class="src" href="https://github.com/example/pkg-audit"', out)
+        self.assertGreaterEqual(out.count("github.com/example/pkg-audit"), 3)
+        pa.BRAND["source_url"] = ""
 
 
 if __name__ == "__main__":
