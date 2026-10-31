@@ -55,6 +55,24 @@ python3 pkg_audit.py ... --state site/report.json --json site/report.json \
 - `--workers N` (default 6) hosts are checked at the same time, but a host never gets more than one
   request at a time, however many ecosystems it serves.
 
+### Let visitors ask for a re-check
+
+`serve.py` serves the page and takes re-check requests (standard library only):
+
+```bash
+python3 serve.py --site site --queue queue.json --cooldown 30 --port 8080
+python3 pkg_audit.py ... --queue queue.json --state site/report.json ...   # in the CI job
+```
+
+Set `"recheck_minutes": 30` in `brand.json` and every mirror gets a "request a re-check" button.
+A request goes into `queue.json`; the next job run checks that mirror whatever its turn is and
+removes it from the queue, and the page marks it "in the queue" until then.
+
+Abuse is bounded on the server, not in the page: only a (group, mirror) pair that is in
+`report.json` can be queued (never an address a visitor types); a mirror checked less than
+`--cooldown` minutes ago, by anyone, is refused with the minutes left; a pair already queued is not
+added again; and there is a small per-client rate limit. No access log, no cookies.
+
 Exit status is 2 when any `mismatch` is found, so a CI job fails and notifies. Copy `assets/*` next
 to `index.html` (font and icon the page references). `examples/` has the list formats and a GitLab
 CI job; pin the commit of this repository you reviewed.

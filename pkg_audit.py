@@ -32,6 +32,7 @@ networks, inside and outside Iran, and probe each PoP, and still pin digests in 
 Python 3.8+, standard library only.
 """
 import argparse
+import contextlib
 import hashlib
 import html
 import http.client
@@ -48,6 +49,11 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows: no locking (the re-check queue then needs one writer)
+    fcntl = None
 
 HUB = "https://registry-1.docker.io"
 ACCEPT = ", ".join([
@@ -422,8 +428,50 @@ def settle(report, active):
                     row["detail"] = "no answer before the run's time budget ran out"
 
 
+@contextlib.contextmanager
+def queue_lock(path):
+    """Exclusive lock for the queue file, shared by the job and the server."""
+    if fcntl is None:
+        yield
+        return
+    with open(str(path) + ".lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def queue_read(path):
+    """{ "<group id>/<mirror name>": requested-at ISO time } (empty if the file is missing or broken)."""
+    try:
+        data = json.loads(Path(path).read_text())
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def queue_write(path, queue):
+    write_atomic(str(path), json.dumps(queue, indent=2, sort_keys=True) + "\n")
+
+
+def queue_add(path, qid):
+    with queue_lock(path):
+        queue = queue_read(path)
+        queue.setdefault(qid, now_iso())
+        queue_write(path, queue)
+
+
+def queue_remove(path, qids):
+    with queue_lock(path):
+        queue = queue_read(path)
+        for qid in qids:
+            queue.pop(qid, None)
+        queue_write(path, queue)
+
+
 def row_of(rows, item):
-    return rows.get(item) or {"verdict": "error", "value": None, "detail": "not checked yet"}
+    return rows.get(item) or {"verdict": "pending", "value": None, "detail": "waiting for its first check"}
 
 
 def load_state(path):
@@ -433,6 +481,13 @@ def load_state(path):
         return {g["id"]: g for g in data["groups"]}
     except (OSError, ValueError, KeyError, TypeError):
         return {}
+
+
+def asked_pairs(queue, specs):
+    """The (group id, mirror name) pairs of the queue that exist in the lists (a request for a
+    mirror that was removed from them is dropped on the next run)."""
+    known = {(gid, name) for gid, _, ms in specs for name, _ in ms}
+    return {tuple(qid.split("/", 1)) for qid in queue if "/" in qid} & known
 
 
 def pick_active(specs, prior, slots, slot):
@@ -457,6 +512,7 @@ BADGE = {  # verdict -> (css class, icon, Persian label)
     "stale": ("stale", "◷", "قدیمی"),
     "mismatch": ("bad", "✕", "ناهمخوان"),
     "error": ("err", "!", "بدون پاسخ"),
+    "pending": ("err", "…", "در صف بررسی"),
 }
 DEFAULT_BRAND = {
     "ours": "",                      # name (as in the targets files) of the operator's own mirror
@@ -468,7 +524,9 @@ DEFAULT_BRAND = {
     "footer_html": "",               # trusted HTML for the page footer
     "site_url": "",                  # public URL of the page, e.g. https://audit.example.com; enables link previews
     "source_url": "",                # public repository of this tool; shown in the header and the notes
-    "og_image": "/og.jpg",           # 1200x630 JPEG, path under site_url, for link previews (Telegram, Bale, ...)
+    "og_image": "/og.jpg",
+    "recheck_minutes": 0,            # >0: show "request a re-check" buttons; a mirror can be re-checked
+                                     # this many minutes after its last check (needs serve.py)           # 1200x630 JPEG, path under site_url, for link previews (Telegram, Bale, ...)
 }
 BRAND = dict(DEFAULT_BRAND)
 
@@ -521,6 +579,9 @@ details.m summary:after{content:"‹";color:var(--muted);font-size:20px;line-hei
 details.m[open] summary:after{transform:rotate(-90deg)}
 .who{min-width:0}.who .host{direction:ltr;text-align:right;display:block;font:13px ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 .when{display:block;color:var(--muted);font-size:12px;margin-top:2px}.when.old{color:var(--stale)}
+.items li.req{justify-content:flex-start;gap:12px;border-bottom:1px dashed var(--line);padding:9px 0}
+.re{font:600 13px var(--font);color:var(--primary);background:transparent;border:1px solid var(--primary);border-radius:999px;padding:3px 14px;cursor:pointer}
+.re:disabled{color:var(--muted);border-color:var(--line);cursor:default}.rs{color:var(--muted);font-size:12.5px}
 .tag{display:inline-block;font-size:11.5px;font-weight:700;color:var(--primary);border:1px solid var(--primary);border-radius:999px;padding:0 8px;margin-inline-start:8px;vertical-align:1px}
 .score{font-weight:800;font-size:17px;min-width:3.2em;text-align:center}.score small{font-weight:400;color:var(--muted);font-size:11.5px;display:block;line-height:1.2}
 .score.good{color:var(--ok)}.score.warn{color:var(--stale)}.score.alert{color:var(--bad)}.score.none{color:var(--err)}
@@ -557,11 +618,36 @@ def checked_label(iso):
     try:
         t = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
-        return "هنوز بررسی نشده", True
+        return "در صف بررسی", True
     local = t.astimezone(timezone(timedelta(hours=3, minutes=30)))
     old = (datetime.now(timezone.utc) - t).total_seconds() > STALE_AFTER
     return ("آخرین بررسی " + local.strftime("%H:%M").translate(FA_DIGITS)
             + (" · قدیمی" if old else "")), old
+
+
+SCRIPT = r'''<script>
+(function(){var CD=__MIN__*60000;
+function fa(n){return String(n).replace(/\d/g,function(d){return '۰۱۲۳۴۵۶۷۸۹'[d]})}
+function say(b,t,off){b.nextElementSibling.textContent=t;b.disabled=!!off}
+function wait(b,left){say(b,'بررسی بعدی تا '+fa(Math.ceil(left/60000))+' دقیقه‌ی دیگر ممکن است',true)}
+document.querySelectorAll('button.re').forEach(function(b){
+  if(b.dataset.queued){say(b,'در صف بررسی',true);return}
+  var t=Date.parse(b.dataset.checked||'');
+  if(t&&CD-(Date.now()-t)>0)wait(b,CD-(Date.now()-t));
+});
+document.addEventListener('click',function(e){
+  var b=e.target.closest&&e.target.closest('button.re');if(!b||b.disabled)return;
+  say(b,'در حال ثبت…',true);
+  fetch('/api/recheck',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({group:b.dataset.g,mirror:b.dataset.m})})
+  .then(function(r){return r.json().then(function(j){return[r.status,j]})})
+  .then(function(x){var s=x[0],j=x[1];
+    if(j.status==='queued')say(b,'در صف بررسی؛ نتیجه تا چند دقیقه‌ی دیگر می‌آید',true);
+    else if(j.status==='cooldown')wait(b,j.retry_after*1000);
+    else say(b,'ثبت نشد؛ کمی بعد دوباره امتحان کنید',false)})
+  .catch(function(){say(b,'ثبت نشد؛ کمی بعد دوباره امتحان کنید',false)});
+});})();
+</script>'''
 
 
 def render_group(g, fa):
@@ -589,13 +675,18 @@ def render_group(g, fa):
             tip = html.escape(f'{ref}: {BADGE[row_of(rows, ref)["verdict"]][2]} {row_of(rows, ref)["detail"]}'.strip())
             strip += f'<i class="sq {"" if cls == "ok" else cls}" title="{tip}"></i>'
         items = ""
+        if BRAND["recheck_minutes"] > 0:
+            items += (f'<li class="req"><button type="button" class="re" data-g="{html.escape(g["id"])}" '
+                      f'data-m="{html.escape(n)}" data-checked="{html.escape(m.get("checked_at") or "")}"'
+                      f'{" data-queued=1" if m.get("queued") else ""}>درخواست بررسی مجدد</button>'
+                      f'<span class="rs" aria-live="polite"></span></li>')
         for ref in sorted(refs, key=lambda r: row_of(rows, r)["verdict"] == "ok"):  # problems first
             cls, icon, label = BADGE[row_of(rows, ref)["verdict"]]
             tip = html.escape(((row_of(rows, ref)["value"] or "") + " " + row_of(rows, ref)["detail"]).strip())
             items += (f'<li><code>{html.escape(ref)}</code><span class="b {cls}" title="{tip}">'
                       f'<span aria-hidden="true">{icon}</span>{label}</span></li>')
         opened = " open" if bad else ""
-        out += (f'<details class="m"{opened}><summary><div class="who"><span class="host">{host}</span>{tag}<span class="when{" old" if seen[1] else ""}">{seen[0]}</span></div>'
+        out += (f'<details class="m"{opened}><summary><div class="who"><span class="host">{host}</span>{tag}<span class="when{" old" if seen[1] else ""}">{seen[0]}{" · در صف بررسی" if m.get("queued") and m.get("checked_at") else ""}</span></div>'
                 f'<div class="score {tone}">{fa(pct)}٪<small>{fa(done)} از {fa(len(refs))}</small></div>'
                 f'<div class="strip">{strip}</div></summary><ul class="items">{items}</ul></details>')
     return (f'<h2 class="gt" id="{g["id"]}">{html.escape(g["title"])}</h2>'
@@ -667,6 +758,7 @@ def page(report):
     src_link = f'<a class="src" href="{html.escape(src)}" rel="noopener">{src_label} ↗</a>' if src else ""
     src_note = (f'<p>کد این بازرس متن‌باز است و هر کسی می‌تواند بخواند، اجرا کند و میرور خودش را اضافه کند: '
                 f'<a href="{html.escape(src)}" dir="ltr">{src_label}</a>.</p>') if src else ""
+    script = SCRIPT.replace("__MIN__", str(int(BRAND["recheck_minutes"]))) if BRAND["recheck_minutes"] > 0 else ""
     social = ""
     if BRAND["site_url"]:
         base = BRAND["site_url"].rstrip("/")
@@ -716,7 +808,7 @@ def page(report):
 <bdi dir="ltr">alpine:3.20@sha256:…</bdi>. آن‌وقت هیچ میرور نمی‌تواند محتوای دیگری بدهد. خروجی کامل:
 <a href="/report.json" dir="ltr">report.json</a>.</p></section>
 <footer>{BRAND["footer_html"]}</footer>
-</div></body></html>"""
+</div>{script}</body></html>"""
 
 
 def write_atomic(path, text):
@@ -743,6 +835,8 @@ def main():
     ap.add_argument("--slot-minutes", type=int, default=5,
                     help="how often the job runs; with --slots it picks this run's turn from the clock (default %(default)s)")
     ap.add_argument("--slot", type=int, help="force this turn (0..slots-1) instead of reading the clock")
+    ap.add_argument("--queue", help="re-check requests (written by serve.py): the mirrors in it are checked in this "
+                                    "run whatever their turn, then removed from it")
     ap.add_argument("--json", help="write the report here")
     ap.add_argument("--html", help="write the static page here")
     args = ap.parse_args()
@@ -765,6 +859,10 @@ def main():
     slot = args.slot if args.slot is not None else int(time.time() // (args.slot_minutes * 60)) % slots
     specs = [("docker", refs, [(m[0], m[1]) for m in docker_mirrors])] + [(k, items[k], targets[k]) for k in kinds]
     active = pick_active(specs, prior, slots, slot)
+    asked = set()
+    if args.queue:  # visitors' re-check requests
+        asked = asked_pairs(queue_read(args.queue), specs)
+        active |= asked
     names = lambda gid: {n for g, n in active if g == gid}
     plans = [docker_group(refs, docker_mirrors, names("docker"), prior.get("docker"))]
     plans += [package_group(k, items[k], targets[k], names(k), prior.get(k)) for k in kinds]
@@ -775,6 +873,12 @@ def main():
     run_jobs(mirror_jobs, args.workers)
     report = {"generated": now_iso(), "groups": [g for g, _, _ in plans if g["items"]]}
     settle(report, active)
+    if args.queue:
+        queue_remove(args.queue, [f"{gid}/{name}" for gid, name in asked])
+        waiting = queue_read(args.queue)
+        for g in report["groups"]:
+            for name, m in g["mirrors"].items():
+                m["queued"] = f"{g['id']}/{name}" in waiting
     if args.json:
         write_atomic(args.json, json.dumps(report, indent=2) + "\n")
     if args.html:
