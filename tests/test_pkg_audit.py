@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -111,11 +112,18 @@ class Verdicts(unittest.TestCase):
         self.assertEqual({r["verdict"] for r in rows.values()}, {"error"})
         self.assertIn("skipped", rows["p7@1.0.0"]["detail"])
 
-    def test_run_budget_skips_the_rest(self):
-        pa.DEADLINE = time.monotonic() - 1  # already used up
+    def test_checks_never_made_leave_no_row_instead_of_an_error(self):
+        pa.DEADLINE = time.monotonic() - 1  # budget already used up
         pa.fetch_value = lambda kind, base, item: "good"
         g = run_group("npm", ["a@1.0.0"], [("m", "https://m")])
-        self.assertIn("time budget", g["mirrors"]["m"]["rows"]["a@1.0.0"]["detail"])
+        self.assertEqual(g["mirrors"]["m"]["rows"], {})  # not an error that would stand for an hour
+        # ...so the mirror is unfinished and the next run checks it at once, whatever its turn
+        prior = {"npm": {"mirrors": {"m": {"url": "https://m", "rows": g["mirrors"]["m"]["rows"]}}}}
+        spec = [("npm", ["a@1.0.0"], [("m", "https://m")])]
+        self.assertEqual(pa.pick_active(spec, prior, 12, 3), {("npm", "m")})
+        # and the page calls it "in the queue", not "no answer"
+        report = {"generated": "2026-01-01T00:00:00Z", "groups": [g]}
+        self.assertIn("در صف بررسی", pa.page(report))
 
 
 class Turns(unittest.TestCase):
@@ -198,19 +206,34 @@ class Pool(unittest.TestCase):
         pa.run_jobs([(f"h{i}", run) for i in range(8)], 3)
         self.assertEqual(state["max"], 3)
 
-    def test_a_stuck_job_is_abandoned_and_its_rows_settle_as_errors(self):
-        pa.DEADLINE, real_grace = time.monotonic() + 0.2, pa.GRACE
-        pa.GRACE = 0.2
+    def test_a_stuck_job_is_abandoned_without_waiting_for_the_whole_budget(self):
+        real = pa.STUCK_AFTER
+        pa.STUCK_AFTER = 0.3
+        pa.DEADLINE = time.monotonic() + 600  # a long budget must not keep the run waiting
         try:
             started = time.monotonic()
-            pa.run_jobs([("slow", lambda: time.sleep(30))], 2)
+            pa.run_jobs([("slow", lambda: time.sleep(30)), ("fast", lambda: None)], 2)
             self.assertLess(time.monotonic() - started, 5)
         finally:
-            pa.DEADLINE, pa.GRACE = None, real_grace
-        report = {"groups": [{"id": "g", "items": ["x"], "mirrors": {"m": {"rows": {}}}}]}
+            pa.DEADLINE, pa.STUCK_AFTER = None, real
+
+    def test_settle_drops_rows_cut_off_mid_request(self):
+        report = {"groups": [{"id": "g", "items": ["x", "y"], "mirrors": {"m": {"rows": {
+            "x": {"verdict": "error", "value": None, "detail": ""},                  # cut off
+            "y": {"verdict": "error", "value": None, "detail": "HTTP 404"}}}}}]}      # a real answer
         pa.settle(report, {("g", "m")})
-        self.assertEqual(report["groups"][0]["mirrors"]["m"]["rows"]["x"]["verdict"], "error")
-        self.assertIn("time budget", report["groups"][0]["mirrors"]["m"]["rows"]["x"]["detail"])
+        self.assertEqual(list(report["groups"][0]["mirrors"]["m"]["rows"]), ["y"])
+
+    def test_old_state_with_unchecked_rows_is_healed_on_load(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "report.json"
+            f.write_text(json.dumps({"groups": [{"id": "npm", "mirrors": {"m": {"url": "https://m", "rows": {
+                "a": {"verdict": "error", "value": None, "detail": "skipped: the run's time budget (--max-seconds) was used up"},
+                "b": {"verdict": "error", "value": None, "detail": "no answer before the run's time budget ran out"},
+                "c": {"verdict": "error", "value": None, "detail": "skipped: 3 requests in a row got no answer"},
+                "d": {"verdict": "ok", "value": "v", "detail": ""}}}}}]}))
+            rows = pa.load_state(f)["npm"]["mirrors"]["m"]["rows"]
+        self.assertEqual(sorted(rows), ["c", "d"])  # only the never-made checks are dropped
 
 
 class PageState(unittest.TestCase):

@@ -65,8 +65,17 @@ ACCEPT = ", ".join([
 
 
 DEADLINE = None      # time.monotonic() value after which remaining checks are skipped (set by --max-seconds)
+STUCK_AFTER = 120    # seconds a thread may go without finishing a request before it is abandoned
 GRACE = 45           # seconds after the budget before stuck threads are abandoned
 GIVE_UP_AFTER = 3    # consecutive items that timed out or could not connect: skip the rest of that mirror
+
+
+PROGRESS = {}
+
+
+def progress():
+    """Called by a worker whenever it starts or finishes something: proof of life for run_jobs."""
+    PROGRESS[threading.get_ident()] = time.monotonic()
 
 
 def out_of_time():
@@ -170,11 +179,17 @@ def read_list(path):
 
 def check_rows(items, rows, check):
     """Run `check(item, row)` for each item, one after another, so a host sees one request at a
-    time. `rows` is filled as it goes: if the run is cut short, what was done is still there."""
+    time. `rows` is filled as it goes: if the run is cut short, what was done is still there.
+    An item that was not checked (out of time) gets no row: it shows as "in the queue" and the
+    mirror counts as unfinished, so the next run checks it, instead of an error that would stand
+    until the mirror's next turn."""
     down = 0
     for item in items:
+        progress()
+        if out_of_time():
+            continue
         row = rows[item] = {"verdict": "error", "value": None, "detail": ""}
-        if out_of_time() or down >= GIVE_UP_AFTER:
+        if down >= GIVE_UP_AFTER:  # a host that answers nothing is a finding, and is reported
             row["detail"] = skip_reason(down)
             continue
         try:
@@ -183,6 +198,7 @@ def check_rows(items, rows, check):
         except Exception as exc:
             row["detail"] = str(exc)
             down = down + 1 if unreachable(exc) else 0
+        progress()
 
 
 def now_iso():
@@ -398,6 +414,7 @@ def run_jobs(jobs, workers):
 
     def worker():
         while True:
+            progress()
             try:
                 fns = todo.get_nowait()
             except queue.Empty:
@@ -411,21 +428,32 @@ def run_jobs(jobs, workers):
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, min(workers, len(by_host))))]
     for t in threads:
         t.start()
-    for t in threads:
-        remaining = None if DEADLINE is None else max(0.0, DEADLINE + GRACE - time.monotonic())
-        t.join(remaining)
+    while True:
+        alive = [t for t in threads if t.is_alive()]
+        if not alive:
+            return
+        now = time.monotonic()
+        if DEADLINE is not None and now > DEADLINE + GRACE:
+            return
+        # every thread left has made no progress for a long time: they are stuck in a network
+        # call that cannot be interrupted, so stop waiting for them (daemon threads)
+        if all(now - PROGRESS.get(t.ident, now) > STUCK_AFTER for t in alive):
+            print(f"giving up on {len(alive)} stuck thread(s)", file=sys.stderr)
+            return
+        time.sleep(0.2)
 
 
 def settle(report, active):
-    """Rows a cut-off run never reached are errors, not absent (only for mirrors checked now)."""
+    """A row still empty after the run is one whose check was cut off mid-request: drop it, so it
+    reads "in the queue" and is checked again, rather than storing an error nobody measured."""
     for g in report["groups"]:
         for name, m in g["mirrors"].items():
             if (g["id"], name) not in active:
                 continue
-            for item in g["items"]:
-                row = m["rows"].setdefault(item, {"verdict": "error", "value": None, "detail": ""})
-                if row["verdict"] == "error" and not row["detail"]:
-                    row["detail"] = "no answer before the run's time budget ran out"
+            for item in list(m["rows"]):
+                row = m["rows"][item]
+                if row["verdict"] == "error" and not row["detail"] and row["value"] is None:
+                    del m["rows"][item]
 
 
 @contextlib.contextmanager
@@ -474,12 +502,22 @@ def row_of(rows, item):
     return rows.get(item) or {"verdict": "pending", "value": None, "detail": "waiting for its first check"}
 
 
+LEGACY_UNCHECKED = ("skipped: the run's time budget", "no answer before the run's time budget")
+
+
 def load_state(path):
-    """Previous report by (group id, mirror name); anything unreadable is simply no state."""
+    """Previous report by group id; anything unreadable is simply no state. Rows that older versions
+    saved for checks they never made (out of time) are dropped, so those mirrors are checked again."""
     try:
         data = json.loads(Path(path).read_text())
-        return {g["id"]: g for g in data["groups"]}
-    except (OSError, ValueError, KeyError, TypeError):
+        groups = {g["id"]: g for g in data["groups"]}
+        for g in groups.values():
+            for m in g.get("mirrors", {}).values():
+                rows = m.get("rows", {})
+                for item in [i for i, r in rows.items() if str(r.get("detail", "")).startswith(LEGACY_UNCHECKED)]:
+                    del rows[item]
+        return groups
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return {}
 
 
