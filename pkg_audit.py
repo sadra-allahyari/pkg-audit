@@ -32,11 +32,13 @@ networks, inside and outside Iran, and probe each PoP, and still pin digests in 
 Python 3.8+, standard library only.
 """
 import argparse
+import contextlib
 import hashlib
 import html
 import http.client
 import json
 import re
+import signal
 import socket
 import ssl
 import sys
@@ -53,6 +55,47 @@ ACCEPT = ", ".join([
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 ])
+
+
+ITEM_LIMIT = 60      # seconds one check of one item may take, retries included
+DEADLINE = None      # time.monotonic() value after which remaining checks are skipped (set by --max-seconds)
+GIVE_UP_AFTER = 3    # consecutive items that timed out or could not connect: skip the rest of that mirror
+
+
+@contextlib.contextmanager
+def time_limit(seconds):
+    """Hard wall-clock limit for the block. Socket timeouts only bound one read, so a server that
+    sends a byte now and then could keep a check (and the whole CI job) alive for hours."""
+    if not hasattr(signal, "SIGALRM"):  # Windows: no limit
+        yield
+        return
+
+    def expired(*_):
+        raise TimeoutError(f"no answer within {seconds}s")
+
+    old = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def out_of_time():
+    return DEADLINE is not None and time.monotonic() > DEADLINE
+
+
+def skip_reason(down):
+    if down >= GIVE_UP_AFTER:
+        return f"skipped: {GIVE_UP_AFTER} requests in a row got no answer"
+    return "skipped: the run's time budget (--max-seconds) was used up"
+
+
+def unreachable(exc):
+    """True for failures that say the host is not answering at all (not an HTTP status)."""
+    return isinstance(exc, (TimeoutError, OSError, http.client.HTTPException)) and not isinstance(
+        exc, urllib.error.HTTPError)
 
 
 class Pinned(http.client.HTTPSConnection):
@@ -144,33 +187,41 @@ def audit_docker(refs, mirrors):
     for ref in refs:
         repo, tag = split(ref)
         try:
-            official[ref] = hub.digest(repo, tag)
+            with time_limit(ITEM_LIMIT):
+                official[ref] = hub.digest(repo, tag)
         except Exception as exc:
             sys.exit(f"{ref}: Docker Hub did not answer ({exc}); nothing to compare against")
     group = {"id": "docker", "title": "Docker", "items": refs, "mirrors": {},
              "note": "digest هر تگ در برابر Docker Hub"}
     for name, url, *ip in mirrors:
-        reg, rows = Registry(url, ip[0] if ip else None), {}
+        reg, rows, down = Registry(url, ip[0] if ip else None), {}, 0
         for ref in refs:
             repo, tag = split(ref)
             row = {"verdict": "error", "value": None, "detail": ""}
+            if out_of_time() or down >= GIVE_UP_AFTER:
+                row["detail"] = skip_reason(down)
+                rows[ref] = row
+                continue
             try:
-                row["value"] = reg.digest(repo, tag)
-                if not reg.manifest_hashes_to(repo, row["value"]):
-                    row.update(verdict="mismatch", detail="manifest bytes do not hash to its digest")
-                elif row["value"] == official[ref]:
-                    row["verdict"] = "ok"
-                else:
-                    try:
-                        known = hub.manifest_hashes_to(repo, row["value"])
-                    except RuntimeError:
-                        known = False
-                    if known:
-                        row.update(verdict="stale", detail="another digest Docker Hub serves for this repository")
+                with time_limit(ITEM_LIMIT):
+                    row["value"] = reg.digest(repo, tag)
+                    if not reg.manifest_hashes_to(repo, row["value"]):
+                        row.update(verdict="mismatch", detail="manifest bytes do not hash to its digest")
+                    elif row["value"] == official[ref]:
+                        row["verdict"] = "ok"
                     else:
-                        row.update(verdict="mismatch", detail="Docker Hub has no manifest with this digest")
+                        try:
+                            known = hub.manifest_hashes_to(repo, row["value"])
+                        except RuntimeError:
+                            known = False
+                        if known:
+                            row.update(verdict="stale", detail="another digest Docker Hub serves for this repository")
+                        else:
+                            row.update(verdict="mismatch", detail="Docker Hub has no manifest with this digest")
+                down = 0
             except Exception as exc:
                 row["detail"] = str(exc)
+                down = down + 1 if unreachable(exc) else 0
             rows[ref] = row
         group["mirrors"][name] = {"url": url, "ip": ip[0] if ip else None, "rows": rows}
     return group
@@ -284,7 +335,8 @@ def audit_packages(kind, items, targets):
     official = {}
     for item in items:
         try:
-            official[item] = fetch_value(kind, OFFICIAL[kind], item)
+            with time_limit(ITEM_LIMIT):
+                official[item] = fetch_value(kind, OFFICIAL[kind], item)
         except Exception as exc:
             print(f"{kind} {item}: official source did not answer ({exc}); skipped", file=sys.stderr)
     items = [i for i in items if i in official]
@@ -293,17 +345,24 @@ def audit_packages(kind, items, targets):
     title, note = TITLES[kind]
     group = {"id": kind, "title": title, "items": items, "mirrors": {}, "note": note}
     for name, base in targets:
-        rows = {}
+        rows, down = {}, 0
         for item in items:
             row = {"verdict": "error", "value": None, "detail": ""}
+            if out_of_time() or down >= GIVE_UP_AFTER:
+                row["detail"] = skip_reason(down)
+                rows[item] = row
+                continue
             try:
-                row["value"] = fetch_value(kind, base.rstrip("/"), item)
+                with time_limit(ITEM_LIMIT):
+                    row["value"] = fetch_value(kind, base.rstrip("/"), item)
                 if row["value"] == official[item]:
                     row["verdict"] = "ok"
                 else:
                     row.update(verdict="mismatch", detail="differs from the official source")
+                down = 0
             except Exception as exc:
                 row["detail"] = str(exc)
+                down = down + 1 if unreachable(exc) else 0
             rows[item] = row
         group["mirrors"][name] = {"url": base, "ip": None, "rows": rows}
     return group
@@ -517,9 +576,13 @@ def main():
     ap.add_argument("--packages", help="file with `kind item` per line (npm, pypi, cargo, maven, rubygems, nodejs, golang, gradle, helm, k8s, hashicorp)")
     ap.add_argument("--targets", help="file with `kind name base-url` per line: the mirrors to check for those kinds")
     ap.add_argument("--brand", help="JSON file overriding the page branding (keys of DEFAULT_BRAND)")
+    ap.add_argument("--max-seconds", type=int, default=1200,
+                    help="stop starting new checks after this long and report the rest as skipped (default %(default)s)")
     ap.add_argument("--json", help="write the report here")
     ap.add_argument("--html", help="write the static page here")
     args = ap.parse_args()
+    global DEADLINE
+    DEADLINE = time.monotonic() + args.max_seconds
     if args.brand:
         BRAND.update(json.loads(Path(args.brand).read_text()))
     refs = [line[0] for line in read_list(args.images)]

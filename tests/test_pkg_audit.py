@@ -84,6 +84,49 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(got, {"ok": "ok", "bad": "mismatch", "down": "error"})
 
 
+class Limits(unittest.TestCase):
+    def test_time_limit_interrupts_a_stalled_call(self):
+        import time
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            with pa.time_limit(1):
+                time.sleep(10)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_mirror_that_never_answers_is_given_up_on(self):
+        calls = []
+        pa.OFFICIAL["npm"] = "https://official"
+
+        def fake(kind, base, item):
+            if base == "https://official":
+                return "good"
+            calls.append(item)
+            raise TimeoutError("no answer")
+        real = pa.fetch_value
+        pa.fetch_value = fake
+        try:
+            g = pa.audit_packages("npm", [f"p{i}@1.0.0" for i in range(8)], [("dead", "https://dead")])
+        finally:
+            pa.fetch_value = real
+        self.assertEqual(len(calls), pa.GIVE_UP_AFTER)
+        rows = g["mirrors"]["dead"]["rows"]
+        self.assertEqual({r["verdict"] for r in rows.values()}, {"error"})
+        self.assertIn("skipped", rows["p7@1.0.0"]["detail"])
+
+
+class Budget(unittest.TestCase):
+    def test_run_budget_skips_the_rest(self):
+        import time
+        pa.OFFICIAL["npm"] = "https://official"
+        real, pa.DEADLINE = pa.fetch_value, time.monotonic() - 1  # already used up
+        pa.fetch_value = lambda kind, base, item: "good"
+        try:
+            g = pa.audit_packages("npm", ["a@1.0.0"], [("m", "https://m")])
+        finally:
+            pa.fetch_value, pa.DEADLINE = real, None
+        self.assertIn("time budget", g["mirrors"]["m"]["rows"]["a@1.0.0"]["detail"])
+
+
 class Page(unittest.TestCase):
     def test_page_renders_and_escapes(self):
         pa.BRAND.update(ours="m", ours_label="<b>us</b>", title="T", name="N", tagline="t", footer_html="<i>f</i>")
