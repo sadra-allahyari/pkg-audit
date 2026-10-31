@@ -137,6 +137,12 @@ class Page(unittest.TestCase):
         self.assertNotIn("<script>", out)
         self.assertIn("&lt;b&gt;us&lt;/b&gt;", out)
         self.assertIn("ناهمخوان", out)
+        self.assertNotIn("og:image", out)  # no site_url, no preview tags
+        pa.BRAND["site_url"] = "https://audit.example.com/"
+        out = pa.page({"generated": "2026-01-01T00:00:00Z", "groups": [group]})
+        self.assertIn('property="og:image" content="https://audit.example.com/og.jpg"', out)
+        self.assertIn('name="twitter:card" content="summary_large_image"', out)
+        pa.BRAND["site_url"] = ""
 
 
 if __name__ == "__main__":

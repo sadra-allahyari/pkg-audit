@@ -383,6 +383,8 @@ DEFAULT_BRAND = {
     "tagline": "",                   # line under it
     "description": "مقایسه‌ی مستقل بسته‌ها و ایمیج‌های میرورها با منبع رسمی",
     "footer_html": "",               # trusted HTML for the page footer
+    "site_url": "",                  # public URL of the page, e.g. https://audit.example.com; enables link previews
+    "og_image": "/og.jpg",           # 1200x630 JPEG, path under site_url, for link previews (Telegram, Bale, ...)
 }
 BRAND = dict(DEFAULT_BRAND)
 
@@ -525,12 +527,24 @@ def page(report):
     nav = "".join(f'<a href="#{g["id"]}">{html.escape(g["title"])}</a>' for g in groups)
     sections = "".join(render_group(g, fa) for g in groups)
 
+    social = ""
+    if BRAND["site_url"]:
+        base = BRAND["site_url"].rstrip("/")
+        img = html.escape(base + BRAND["og_image"])
+        t, d = html.escape(BRAND["title"]), html.escape(BRAND["description"])
+        social = (f'<link rel="canonical" href="{html.escape(base)}/"><meta name="theme-color" content="#0f1916">'
+                  f'<meta property="og:type" content="website"><meta property="og:locale" content="fa_IR">'
+                  f'<meta property="og:url" content="{html.escape(base)}/"><meta property="og:title" content="{t}">'
+                  f'<meta property="og:description" content="{d}"><meta property="og:image" content="{img}">'
+                  f'<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">'
+                  f'<meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="{t}">'
+                  f'<meta name="twitter:description" content="{d}"><meta name="twitter:image" content="{img}">')
     return f"""<!doctype html>
 <html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(BRAND["title"])}</title>
 <meta name="description" content="{html.escape(BRAND["description"])}">
-<link rel="icon" href="/favicon.svg" type="image/svg+xml"><style>{CSS}</style></head>
+{social}<link rel="icon" href="/favicon.svg" type="image/svg+xml"><style>{CSS}</style></head>
 <body><div class="wrap">
 <header><img src="/favicon.svg" alt="" width="44" height="44">
 <div class="brand">{html.escape(BRAND["name"])}<small>{html.escape(BRAND["tagline"])}</small></div></header>
