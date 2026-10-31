@@ -8,3 +8,9 @@ docker.iranserver.com https://docker.iranserver.com
 registry.docker.ir    https://registry.docker.ir
 docker.abrha.net      https://docker.abrha.net
 focker.ir             https://focker.ir
+docker.kernel.ir      https://docker.kernel.ir
+docker.mobinhost.com  https://docker.mobinhost.com
+hub.mecan.ir          https://hub.mecan.ir
+docker-mirror.liara.ir https://docker-mirror.liara.ir
+docker.chabokan.net   https://docker.chabokan.net
+docker.novin.cloud    https://docker.novin.cloud

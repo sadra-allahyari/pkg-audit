@@ -52,6 +52,13 @@ class Values(unittest.TestCase):
         pa.get = lambda url, accept="*/*": ("", b"---\n13.2.1 |checksum:" + b"a" * 64 + b",ruby:>= 2\n")
         self.assertEqual(pa.fetch_value("rubygems", "https://m", "rake@13.2.1"), "a" * 64)
 
+    def test_maven_rejects_html(self):
+        pa.get = lambda url, accept="*/*": ("text/html", b"<!doctype html><html>")
+        with self.assertRaises(RuntimeError):
+            pa.fetch_value("maven", "https://m", "junit:junit:4.13.2")
+        pa.get = lambda url, accept="*/*": ("text/plain", b"8ac9e16d933b6fb43bc7f576336b8f4d7eb5ba12\n")
+        self.assertEqual(pa.fetch_value("maven", "https://m", "junit:junit:4.13.2"), "8ac9e16d933b6fb43bc7f576336b8f4d7eb5ba12")
+
     def test_missing_version_is_an_error(self):
         pa.get = lambda url, accept="*/*": ("", b'{"vers":"1.0.0","cksum":"c1"}\n')
         with self.assertRaises(RuntimeError):

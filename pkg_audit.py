@@ -255,7 +255,10 @@ def fetch_value(kind, base, item):
     if kind == "maven":
         group, artifact, version = item.split(":")
         _, body = get(f"{base}/{group.replace('.', '/')}/{artifact}/{version}/{artifact}-{version}.jar.sha1")
-        return body.decode().split()[0].lower()
+        value = body.decode("utf-8", "replace").split()[0].lower() if body.strip() else ""
+        if not re.fullmatch(r"[0-9a-f]{40}", value):  # an HTML page or error text is no answer
+            raise RuntimeError("not a sha1 checksum")
+        return value
     if kind == "rubygems":
         name, _, version = item.rpartition("@")
         _, body = get(f"{base}/info/{name}")

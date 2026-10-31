@@ -11,3 +11,14 @@ gradle    mymirror  https://mirror-gradle.example.com/distributions
 helm      mymirror  https://mirror-kubernetes.example.com/helm
 k8s       mymirror  https://mirror-kubernetes.example.com/release
 hashicorp mymirror  https://mirror-hashicorp.example.com
+
+# Public mirrors of other operators found answering anonymously (2026-10-31); host names are labels.
+npm   package-mirror.liara.ir  https://package-mirror.liara.ir/repository/npm
+npm   mirror.novin.cloud       https://mirror.novin.cloud/artifactory/api/npm/npm
+npm   npm.mobinhost.com        https://npm.mobinhost.com
+npm   npm.iranserver.com       https://npm.iranserver.com/repository/npm
+pypi  package-mirror.liara.ir  https://package-mirror.liara.ir/repository/pypi
+pypi  mirror.novin.cloud       https://mirror.novin.cloud/artifactory/api/pypi/pypi
+pypi  pypi.iranserver.com      https://pypi.iranserver.com/repository/pypi
+pypi  mirror-pypi.runflare.com https://mirror-pypi.runflare.com
+maven maven.myket.ir           https://maven.myket.ir
