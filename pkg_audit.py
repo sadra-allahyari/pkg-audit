@@ -32,16 +32,17 @@ networks, inside and outside Iran, and probe each PoP, and still pin digests in 
 Python 3.8+, standard library only.
 """
 import argparse
-import contextlib
 import hashlib
 import html
 import http.client
 import json
+import os
 import re
-import signal
 import socket
+import queue
 import ssl
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -57,29 +58,9 @@ ACCEPT = ", ".join([
 ])
 
 
-ITEM_LIMIT = 60      # seconds one check of one item may take, retries included
 DEADLINE = None      # time.monotonic() value after which remaining checks are skipped (set by --max-seconds)
+GRACE = 45           # seconds after the budget before stuck threads are abandoned
 GIVE_UP_AFTER = 3    # consecutive items that timed out or could not connect: skip the rest of that mirror
-
-
-@contextlib.contextmanager
-def time_limit(seconds):
-    """Hard wall-clock limit for the block. Socket timeouts only bound one read, so a server that
-    sends a byte now and then could keep a check (and the whole CI job) alive for hours."""
-    if not hasattr(signal, "SIGALRM"):  # Windows: no limit
-        yield
-        return
-
-    def expired(*_):
-        raise TimeoutError(f"no answer within {seconds}s")
-
-    old = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, old)
 
 
 def out_of_time():
@@ -181,50 +162,82 @@ def read_list(path):
             if line.split("#", 1)[0].strip()]
 
 
-def audit_docker(refs, mirrors):
-    hub = Registry(HUB)
-    official = {}
-    for ref in refs:
-        repo, tag = split(ref)
+def check_rows(items, rows, check):
+    """Run `check(item, row)` for each item, one after another, so a host sees one request at a
+    time. `rows` is filled as it goes: if the run is cut short, what was done is still there."""
+    down = 0
+    for item in items:
+        row = rows[item] = {"verdict": "error", "value": None, "detail": ""}
+        if out_of_time() or down >= GIVE_UP_AFTER:
+            row["detail"] = skip_reason(down)
+            continue
         try:
-            with time_limit(ITEM_LIMIT):
-                official[ref] = hub.digest(repo, tag)
+            check(item, row)
+            down = 0
         except Exception as exc:
-            sys.exit(f"{ref}: Docker Hub did not answer ({exc}); nothing to compare against")
-    group = {"id": "docker", "title": "Docker", "items": refs, "mirrors": {},
+            row["detail"] = str(exc)
+            down = down + 1 if unreachable(exc) else 0
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def keep_or_new(prior, name, url, ip, active):
+    """A mirror's entry: fresh when it is checked in this run, else the previous run's result
+    (shown until its next turn comes), else empty."""
+    if not active and prior and prior.get("url") == url:
+        return {"url": url, "ip": ip, "rows": prior["rows"], "checked_at": prior.get("checked_at")}
+    return {"url": url, "ip": ip, "rows": {}, "checked_at": now_iso() if active else None}
+
+
+def docker_group(refs, mirrors, active, prior_group=None):
+    """The group, the job that asks Docker Hub (None if no mirror of it is checked now) and a
+    function returning the mirror jobs once Docker Hub's answers are in."""
+    hub = Registry(HUB)
+    official, failed = {}, []
+    group = {"id": "docker", "title": "Docker", "items": list(refs), "mirrors": {},
              "note": "digest هر تگ در برابر Docker Hub"}
-    for name, url, *ip in mirrors:
-        reg, rows, down = Registry(url, ip[0] if ip else None), {}, 0
+    prior = (prior_group or {}).get("mirrors", {})
+
+    def ask_hub():
         for ref in refs:
             repo, tag = split(ref)
-            row = {"verdict": "error", "value": None, "detail": ""}
-            if out_of_time() or down >= GIVE_UP_AFTER:
-                row["detail"] = skip_reason(down)
-                rows[ref] = row
-                continue
             try:
-                with time_limit(ITEM_LIMIT):
-                    row["value"] = reg.digest(repo, tag)
-                    if not reg.manifest_hashes_to(repo, row["value"]):
-                        row.update(verdict="mismatch", detail="manifest bytes do not hash to its digest")
-                    elif row["value"] == official[ref]:
-                        row["verdict"] = "ok"
-                    else:
-                        try:
-                            known = hub.manifest_hashes_to(repo, row["value"])
-                        except RuntimeError:
-                            known = False
-                        if known:
-                            row.update(verdict="stale", detail="another digest Docker Hub serves for this repository")
-                        else:
-                            row.update(verdict="mismatch", detail="Docker Hub has no manifest with this digest")
-                down = 0
+                official[ref] = hub.digest(repo, tag)
             except Exception as exc:
-                row["detail"] = str(exc)
-                down = down + 1 if unreachable(exc) else 0
-            rows[ref] = row
-        group["mirrors"][name] = {"url": url, "ip": ip[0] if ip else None, "rows": rows}
-    return group
+                failed.append(f"{ref}: Docker Hub did not answer ({exc})")
+                return
+
+    def one_mirror(reg, rows):
+        def check(ref, row):
+            repo, tag = split(ref)
+            row["value"] = reg.digest(repo, tag)
+            if not reg.manifest_hashes_to(repo, row["value"]):
+                row.update(verdict="mismatch", detail="manifest bytes do not hash to its digest")
+            elif row["value"] == official[ref]:
+                row["verdict"] = "ok"
+            else:
+                try:
+                    known = hub.manifest_hashes_to(repo, row["value"])
+                except RuntimeError:
+                    known = False
+                if known:
+                    row.update(verdict="stale", detail="another digest Docker Hub serves for this repository")
+                else:
+                    row.update(verdict="mismatch", detail="Docker Hub has no manifest with this digest")
+        return lambda: check_rows(refs, rows, check)
+
+    def after_official():
+        if failed:
+            sys.exit(failed[0] + "; nothing to compare against")
+        return [(urllib.parse.urlsplit(url).hostname,
+                 one_mirror(Registry(url, (ip or [None])[0]), group["mirrors"][name]["rows"]))
+                for name, url, *ip in mirrors if name in active]
+
+    for name, url, *ip in mirrors:
+        group["mirrors"][name] = keep_or_new(prior.get(name), name, url, ip[0] if ip else None, name in active)
+    return group, (("registry-1.docker.io", ask_hub) if active else None), after_official
 
 
 # Package ecosystems: the same question as for Docker, asked of metadata that is immutable for a
@@ -331,41 +344,111 @@ def fetch_value(kind, base, item):
     return "sha256:" + hashlib.sha256(body).hexdigest()
 
 
-def audit_packages(kind, items, targets):
+def package_group(kind, items, targets, active, prior_group=None):
+    """Like docker_group, for one package ecosystem."""
     official = {}
-    for item in items:
-        try:
-            with time_limit(ITEM_LIMIT):
-                official[item] = fetch_value(kind, OFFICIAL[kind], item)
-        except Exception as exc:
-            print(f"{kind} {item}: official source did not answer ({exc}); skipped", file=sys.stderr)
-    items = [i for i in items if i in official]
-    if not items:
-        return None
     title, note = TITLES[kind]
-    group = {"id": kind, "title": title, "items": items, "mirrors": {}, "note": note}
-    for name, base in targets:
-        rows, down = {}, 0
+    group = {"id": kind, "title": title, "items": list(items), "mirrors": {}, "note": note}
+    prior = (prior_group or {}).get("mirrors", {})
+
+    def ask_official():
         for item in items:
-            row = {"verdict": "error", "value": None, "detail": ""}
-            if out_of_time() or down >= GIVE_UP_AFTER:
-                row["detail"] = skip_reason(down)
-                rows[item] = row
-                continue
             try:
-                with time_limit(ITEM_LIMIT):
-                    row["value"] = fetch_value(kind, base.rstrip("/"), item)
-                if row["value"] == official[item]:
-                    row["verdict"] = "ok"
-                else:
-                    row.update(verdict="mismatch", detail="differs from the official source")
-                down = 0
+                official[item] = fetch_value(kind, OFFICIAL[kind], item)
             except Exception as exc:
-                row["detail"] = str(exc)
-                down = down + 1 if unreachable(exc) else 0
-            rows[item] = row
-        group["mirrors"][name] = {"url": base, "ip": None, "rows": rows}
-    return group
+                print(f"{kind} {item}: official source did not answer ({exc}); skipped", file=sys.stderr)
+
+    def one_mirror(base, rows):
+        def check(item, row):
+            row["value"] = fetch_value(kind, base.rstrip("/"), item)
+            if row["value"] == official[item]:
+                row["verdict"] = "ok"
+            else:
+                row.update(verdict="mismatch", detail="differs from the official source")
+        return lambda: check_rows(group["items"], rows, check)
+
+    def after_official():
+        if active:  # items the official source could not answer are not compared
+            group["items"] = [i for i in items if i in official]
+        return [(urllib.parse.urlsplit(base).hostname, one_mirror(base, group["mirrors"][name]["rows"]))
+                for name, base in targets if name in active and group["items"]]
+
+    for name, base in targets:
+        group["mirrors"][name] = keep_or_new(prior.get(name), name, base, None, name in active)
+    return group, ((urllib.parse.urlsplit(OFFICIAL[kind]).hostname, ask_official) if active else None), after_official
+
+
+def run_jobs(jobs, workers):
+    """Run (host, fn) jobs on up to `workers` threads. Jobs of one host run one after another
+    (one request at a time per host, however many ecosystems it serves); different hosts overlap.
+    Returns when all are done or the run's time budget plus a grace period has passed: a thread
+    stuck in a network call cannot be killed, so it is abandoned (daemon threads)."""
+    by_host = {}
+    for host, fn in jobs:
+        by_host.setdefault(host, []).append(fn)
+    todo = queue.Queue()
+    for fns in by_host.values():
+        todo.put(fns)
+
+    def worker():
+        while True:
+            try:
+                fns = todo.get_nowait()
+            except queue.Empty:
+                return
+            for fn in fns:
+                try:
+                    fn()
+                except Exception as exc:  # a bug in one check must not stop the others
+                    print(f"job failed: {exc!r}", file=sys.stderr)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, min(workers, len(by_host))))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        remaining = None if DEADLINE is None else max(0.0, DEADLINE + GRACE - time.monotonic())
+        t.join(remaining)
+
+
+def settle(report, active):
+    """Rows a cut-off run never reached are errors, not absent (only for mirrors checked now)."""
+    for g in report["groups"]:
+        for name, m in g["mirrors"].items():
+            if (g["id"], name) not in active:
+                continue
+            for item in g["items"]:
+                row = m["rows"].setdefault(item, {"verdict": "error", "value": None, "detail": ""})
+                if row["verdict"] == "error" and not row["detail"]:
+                    row["detail"] = "no answer before the run's time budget ran out"
+
+
+def row_of(rows, item):
+    return rows.get(item) or {"verdict": "error", "value": None, "detail": "not checked yet"}
+
+
+def load_state(path):
+    """Previous report by (group id, mirror name); anything unreadable is simply no state."""
+    try:
+        data = json.loads(Path(path).read_text())
+        return {g["id"]: g for g in data["groups"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def pick_active(specs, prior, slots, slot):
+    """specs: [(group id, items, [(mirror name, url)])]. Which (group id, name) pairs to check now.
+    Hosts are spread evenly over `slots` turns; a mirror with no usable earlier result (new, URL
+    changed, items added) is checked at once whatever its turn."""
+    hosts = sorted({urllib.parse.urlsplit(url).hostname for _, _, ms in specs for _, url in ms})
+    turn = {h: i % slots for i, h in enumerate(hosts)}
+    active = set()
+    for gid, items, ms in specs:
+        for name, url in ms:
+            old = prior.get(gid, {}).get("mirrors", {}).get(name)
+            fresh = bool(old) and old.get("url") == url and all(i in old.get("rows", {}) for i in items)
+            if slots <= 1 or not fresh or turn[urllib.parse.urlsplit(url).hostname] == slot:
+                active.add((gid, name))
+    return active
 
 
 FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
@@ -437,6 +520,7 @@ details.m summary:hover{background:var(--errbg)}
 details.m summary:after{content:"‹";color:var(--muted);font-size:20px;line-height:1;transition:transform .15s}
 details.m[open] summary:after{transform:rotate(-90deg)}
 .who{min-width:0}.who .host{direction:ltr;text-align:right;display:block;font:13px ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.when{display:block;color:var(--muted);font-size:12px;margin-top:2px}.when.old{color:var(--stale)}
 .tag{display:inline-block;font-size:11.5px;font-weight:700;color:var(--primary);border:1px solid var(--primary);border-radius:999px;padding:0 8px;margin-inline-start:8px;vertical-align:1px}
 .score{font-weight:800;font-size:17px;min-width:3.2em;text-align:center}.score small{font-weight:400;color:var(--muted);font-size:11.5px;display:block;line-height:1.2}
 .score.good{color:var(--ok)}.score.warn{color:var(--stale)}.score.alert{color:var(--bad)}.score.none{color:var(--err)}
@@ -465,6 +549,21 @@ details.m summary{grid-template-columns:minmax(0,1fr) auto 18px;padding:12px 14p
 """
 
 
+STALE_AFTER = 3 * 3600   # a result older than this is shown as old
+
+
+def checked_label(iso):
+    """('آخرین بررسی ساعت HH:MM', is_old) in Tehran time, from a mirror's checked_at."""
+    try:
+        t = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return "هنوز بررسی نشده", True
+    local = t.astimezone(timezone(timedelta(hours=3, minutes=30)))
+    old = (datetime.now(timezone.utc) - t).total_seconds() > STALE_AFTER
+    return ("آخرین بررسی " + local.strftime("%H:%M").translate(FA_DIGITS)
+            + (" · قدیمی" if old else "")), old
+
+
 def render_group(g, fa):
     refs, mirrors = g["items"], g["mirrors"]
     summary = []
@@ -478,6 +577,7 @@ def render_group(g, fa):
     summary.sort(key=lambda t: t[:4])  # ours first, then problems, then best score
     out = ""
     for _, _, _, n, m, done, bad, answered, ours in summary:
+        seen = checked_label(m.get("checked_at"))
         rows = m["rows"]
         pct = round(100 * done / len(refs)) if refs else 0
         tone = "none" if not answered else "alert" if bad else "good" if done == len(refs) else "warn"
@@ -485,17 +585,17 @@ def render_group(g, fa):
         tag = f'<span class="tag">{html.escape(BRAND["ours_label"])}</span>' if ours else ""
         strip = ""
         for ref in refs:
-            cls = BADGE[rows[ref]["verdict"]][0]
-            tip = html.escape(f'{ref}: {BADGE[rows[ref]["verdict"]][2]} {rows[ref]["detail"]}'.strip())
+            cls = BADGE[row_of(rows, ref)["verdict"]][0]
+            tip = html.escape(f'{ref}: {BADGE[row_of(rows, ref)["verdict"]][2]} {row_of(rows, ref)["detail"]}'.strip())
             strip += f'<i class="sq {"" if cls == "ok" else cls}" title="{tip}"></i>'
         items = ""
-        for ref in sorted(refs, key=lambda r: rows[r]["verdict"] == "ok"):  # problems first
-            cls, icon, label = BADGE[rows[ref]["verdict"]]
-            tip = html.escape(((rows[ref]["value"] or "") + " " + rows[ref]["detail"]).strip())
+        for ref in sorted(refs, key=lambda r: row_of(rows, r)["verdict"] == "ok"):  # problems first
+            cls, icon, label = BADGE[row_of(rows, ref)["verdict"]]
+            tip = html.escape(((row_of(rows, ref)["value"] or "") + " " + row_of(rows, ref)["detail"]).strip())
             items += (f'<li><code>{html.escape(ref)}</code><span class="b {cls}" title="{tip}">'
                       f'<span aria-hidden="true">{icon}</span>{label}</span></li>')
         opened = " open" if bad else ""
-        out += (f'<details class="m"{opened}><summary><div class="who"><span class="host">{host}</span>{tag}</div>'
+        out += (f'<details class="m"{opened}><summary><div class="who"><span class="host">{host}</span>{tag}<span class="when{" old" if seen[1] else ""}">{seen[0]}</span></div>'
                 f'<div class="score {tone}">{fa(pct)}٪<small>{fa(done)} از {fa(len(refs))}</small></div>'
                 f'<div class="strip">{strip}</div></summary><ul class="items">{items}</ul></details>')
     return (f'<h2 class="gt" id="{g["id"]}">{html.escape(g["title"])}</h2>'
@@ -634,6 +734,15 @@ def main():
     ap.add_argument("--brand", help="JSON file overriding the page branding (keys of DEFAULT_BRAND)")
     ap.add_argument("--max-seconds", type=int, default=1200,
                     help="stop starting new checks after this long and report the rest as skipped (default %(default)s)")
+    ap.add_argument("--workers", type=int, default=6,
+                    help="hosts checked at the same time; each host still gets one request at a time (default %(default)s)")
+    ap.add_argument("--state", help="previous report.json: mirrors not checked in this run keep their last result "
+                                    "(and its time) until their turn comes")
+    ap.add_argument("--slots", type=int, default=1,
+                    help="spread the hosts over this many runs: a run checks 1/N of them (default 1 = all every run)")
+    ap.add_argument("--slot-minutes", type=int, default=5,
+                    help="how often the job runs; with --slots it picks this run's turn from the clock (default %(default)s)")
+    ap.add_argument("--slot", type=int, help="force this turn (0..slots-1) instead of reading the clock")
     ap.add_argument("--json", help="write the report here")
     ap.add_argument("--html", help="write the static page here")
     args = ap.parse_args()
@@ -642,26 +751,41 @@ def main():
     if args.brand:
         BRAND.update(json.loads(Path(args.brand).read_text()))
     refs = [line[0] for line in read_list(args.images)]
-    report = {"generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "groups": [audit_docker(refs, read_list(args.mirrors))]}
+    docker_mirrors = read_list(args.mirrors)
+    items, targets = {}, {}
     if args.packages and args.targets:
-        items, targets = {}, {}
         for kind, item in read_list(args.packages):
             items.setdefault(kind, []).append(item)
         for kind, name, base in read_list(args.targets):
             targets.setdefault(kind, []).append((name, base))
-        for kind in OFFICIAL:
-            if items.get(kind) and targets.get(kind):
-                group = audit_packages(kind, items[kind], targets[kind])
-                if group:
-                    report["groups"].append(group)
+    kinds = [k for k in OFFICIAL if items.get(k) and targets.get(k)]
+
+    prior = load_state(args.state) if args.state else {}
+    slots = max(1, args.slots)
+    slot = args.slot if args.slot is not None else int(time.time() // (args.slot_minutes * 60)) % slots
+    specs = [("docker", refs, [(m[0], m[1]) for m in docker_mirrors])] + [(k, items[k], targets[k]) for k in kinds]
+    active = pick_active(specs, prior, slots, slot)
+    names = lambda gid: {n for g, n in active if g == gid}
+    plans = [docker_group(refs, docker_mirrors, names("docker"), prior.get("docker"))]
+    plans += [package_group(k, items[k], targets[k], names(k), prior.get(k)) for k in kinds]
+    # Phase 1: ask every official source that is needed now (different sources at the same time).
+    run_jobs([official for _, official, _ in plans if official], args.workers)
+    # Phase 2: ask this run's mirrors; one request at a time per host, several hosts at once.
+    mirror_jobs = [job for _, _, after in plans for job in after()]
+    run_jobs(mirror_jobs, args.workers)
+    report = {"generated": now_iso(), "groups": [g for g, _, _ in plans if g["items"]]}
+    settle(report, active)
     if args.json:
         write_atomic(args.json, json.dumps(report, indent=2) + "\n")
     if args.html:
         write_atomic(args.html, page(report))
     bad = 0
+    print(f"turn {slot + 1}/{slots}: {len(active)} mirror entries checked, "
+          f"{sum(len(g['mirrors']) for g in report['groups']) - len(active)} kept from the previous run")
     for g in report["groups"]:
         for name, mirror in g["mirrors"].items():
+            if (g["id"], name) not in active:
+                continue
             counts = {}
             for row in mirror["rows"].values():
                 counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
@@ -670,7 +794,8 @@ def main():
             for ref, row in mirror["rows"].items():
                 if row["verdict"] in ("mismatch", "error"):
                     print(f"   {row['verdict'].upper()} {ref} {row['value']} {row['detail']}")
-    sys.exit(2 if bad else 0)
+    sys.stdout.flush()
+    os._exit(2 if bad else 0)  # abandoned threads must not keep the process alive
 
 
 if __name__ == "__main__":

@@ -36,6 +36,25 @@ python3 pkg_audit.py examples/images.txt examples/docker-mirrors.txt \
   --brand examples/brand.json --json site/report.json --html site/index.html
 ```
 
+### Spread the checks over the hour
+
+A full run is a few hundred requests to dozens of hosts. Instead of all at once, run the job every
+few minutes and let each run check only its share:
+
+```bash
+python3 pkg_audit.py ... --state site/report.json --json site/report.json \
+  --slots 12 --slot-minutes 5     # cron: */5 * * * *  -> every host once an hour
+```
+
+- `--slots N` spreads the hosts evenly over N runs; the turn comes from the clock (`--slot-minutes`
+  is how often the job runs), or force one with `--slot I`.
+- `--state` is the previous `report.json`. A mirror that is not checked in this run keeps its last
+  result and its time (the page shows "last checked HH:MM"), until its turn comes.
+- A mirror with no earlier result (new, changed URL, new items) is checked at once.
+- Only the official sources needed by this run's mirrors are asked.
+- `--workers N` (default 6) hosts are checked at the same time, but a host never gets more than one
+  request at a time, however many ecosystems it serves.
+
 Exit status is 2 when any `mismatch` is found, so a CI job fails and notifies. Copy `assets/*` next
 to `index.html` (font and icon the page references). `examples/` has the list formats and a GitLab
 CI job; pin the commit of this repository you reviewed.
